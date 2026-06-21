@@ -1,0 +1,688 @@
+"""
+rnn_mt5_ensemble.py
+Script modulaire pour:
+- récupérer données MT5 (configurable symbol/timeframe/start/end)
+- construire features, label binaire next-bar (BUY/SELL)
+- transformer 2D -> 3D pour LSTM/GRU (fonction X_3d_RNN)
+- builder RNN (LSTM/GRU) avec Dropout et sortie Dense(sigmoid)
+- entraîner N models (bagging/bootstrap) avec EarlyStopping (ici N=100 par défaut)
+- évaluer chaque modèle via métriques économiques (rendement / drawdown ratio, Sharpe)
+- sélectionner top 3, sauvegarder
+- système de vote majoritaire sur 3 modèles sélectionnés pour signaux BUY/SELL
+- fonctions d'inférence live via MT5 (screener + envoi d'ordres)
+Inspired & guided by "Python for Finance and Algorithmic trading" (RNN/ensemble sections). 
+Key refs: transformation 2D->3D, dropout, voting/bagging, standardization/inverse. (voir doc). 
+
+rnn_mt5_ensemble_full.py
+Version: applied "next steps" from the PDF + improvements:
+ - richer features via pandas_ta (or fallback)
+ - candlestick pattern detection (simple fallback)
+ - backtester with realistic cost model (spread/slippage/commission) using MT5 symbol info
+ - order execution with TP/SL based on ATR and lot sizing by risk% of equity
+ - quick-test mode (N_MODELS small, EPOCHS small) for pipeline validation
+ - logging to CSV for monitoring
+ - modular structure
+"""
+
+import os
+import math
+import time
+import json
+import random
+import joblib
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+
+# MT5
+import MetaTrader5 as mt5
+
+# sklearn
+from sklearn.preprocessing import StandardScaler
+
+# tensorflow
+import tensorflow as tf
+from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.layers import Dense, LSTM, GRU, Dropout, InputLayer
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.optimizers import Adam
+
+# optional TA
+try:
+    import pandas_ta as ta
+    TA_AVAILABLE = True
+except Exception:
+    TA_AVAILABLE = False
+
+# progress
+from tqdm import tqdm
+
+import warnings
+warnings.filterwarnings("ignore")
+
+base_path = os.path.dirname(__file__)  # Répertoire du script actuel
+
+# -------------------------
+# CONFIG
+# -------------------------
+CONFIG = {
+    # Data
+    "SYMBOL": "XAUUSD",
+    "TIMEFRAME": mt5.TIMEFRAME_M30,
+    "START": "2026-01-01", # Toujours verifer si les donnees sont disponibles sur metatrader
+    "END": None,  # None => now
+    # Model / Training
+    "LOOKBACK": 64,
+    "FEATURE_COLS": ["ret_1","ret_4","ret_96","ma50","ma200","atr14","rsi14","rv_96","engulfing","doji"],
+    "N_MODELS": 5, # 100
+    "TOP_K": 3,
+    "EPOCHS": 50,
+    "BATCH_SIZE": 64,
+    "PATIENCE": 5,
+    "TEST_SIZE": 0.20,
+    # Quick test override (set to True to run small/fast experiment)
+    "QUICK_TEST": False, # set to True for quick test mode
+    "QUICK_N_MODELS": 3,
+    "QUICK_EPOCHS": 3,
+    # Costs & thresholds
+    "SPREAD_PIPS": 1.0,
+    "SLIPPAGE_PIPS": 0.5,
+    "COMMISSION_RT_USD": 7.0,
+    "THRESH_BUY": 0.55,
+    "THRESH_SELL": 0.45,
+    # Risk sizing
+    "RISK_PER_TRADE_PCT": 0.1,  # percent of equity risked per trade
+    # Files & flags
+    "MODEL_DIR": os.path.join(base_path, "models"),
+    "DATA_DIR": os.path.join(base_path, "data"),
+    "LOG_FILE": "live_signals_log.csv",
+    "DRY_RUN": False,  # never execute live orders unless you set False, (True pour tests / False pour exécution réelle), DRY_RUN==False=>Execute orders on metatrader
+    "RANDOM_SEED": 42,
+}
+
+if CONFIG["QUICK_TEST"]:
+    CONFIG["N_MODELS"] = CONFIG["QUICK_N_MODELS"]
+    CONFIG["EPOCHS"] = CONFIG["QUICK_EPOCHS"]
+
+os.makedirs(CONFIG["MODEL_DIR"], exist_ok=True)
+os.makedirs(CONFIG["DATA_DIR"], exist_ok=True)
+random.seed(CONFIG["RANDOM_SEED"])
+np.random.seed(CONFIG["RANDOM_SEED"])
+tf.random.set_seed(CONFIG["RANDOM_SEED"])
+
+# -------------------------
+# UTILITIES
+# -------------------------
+def init_mt5():
+    if not mt5.initialize():
+        raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
+    si = mt5.symbol_info(CONFIG["SYMBOL"])
+    if si is None or not si.visible:
+        raise RuntimeError(f"Symbol {CONFIG['SYMBOL']} not available/visible in MT5.")
+    return si
+
+def timeframe_to_minutes(tf):
+    mapping = {
+        mt5.TIMEFRAME_M1:1, mt5.TIMEFRAME_M5:5, mt5.TIMEFRAME_M15:15, mt5.TIMEFRAME_M30:30,
+        mt5.TIMEFRAME_H1:60, mt5.TIMEFRAME_H4:240, mt5.TIMEFRAME_D1:1440
+    }
+    return mapping.get(tf, 15)
+
+# -------------------------
+# DATA FETCH & FEATURES
+# -------------------------
+def fetch_mt5(symbol, timeframe, start, end=None, chunk_days=180):
+    init_mt5()
+    start_dt = pd.to_datetime(start)
+    end_dt = pd.to_datetime(end) if end else pd.to_datetime(datetime.now())
+    parts = []
+    cur = start_dt
+    while cur < end_dt:
+        nxt = min(cur + pd.Timedelta(days=chunk_days), end_dt)
+        rates = mt5.copy_rates_range(symbol, timeframe, cur, nxt)
+        if rates is None or len(rates) == 0:
+            cur = nxt
+            continue
+        df = pd.DataFrame(rates)
+        df["time"] = pd.to_datetime(df["time"], unit="s")
+        df = df.set_index("time")
+        parts.append(df)
+        cur = nxt
+        time.sleep(0.05)
+    if not parts:
+        raise RuntimeError("No data fetched.")
+    df = pd.concat(parts).sort_index()
+    df = df[~df.index.duplicated(keep='first')]
+    return df[["open","high","low","close","tick_volume","spread","real_volume"]].copy()
+
+def add_features_full(df):
+    df = df.copy()
+    df["ln_close"] = np.log(df["close"])
+    df["ret_1"] = df["ln_close"].diff(1)
+    df["ret_4"] = df["ln_close"].diff(4)
+    df["ret_96"] = df["ln_close"].diff(96)
+    if TA_AVAILABLE:
+        df["atr14"] = ta.atr(df["high"], df["low"], df["close"], length=14)
+        df["rsi14"] = ta.rsi(df["close"], length=14)
+        df["ma50"] = ta.sma(df["close"], length=50)
+        df["ma200"] = ta.sma(df["close"], length=200)
+        df["rv_96"] = df["ret_1"].rolling(96).std() * np.sqrt((24*60)/timeframe_to_minutes(CONFIG["TIMEFRAME"]) * 252)
+        try:
+            patt = ta.cdl_pattern(df["open"], df["high"], df["low"], df["close"])
+            if "CDL_ENGULFING" in patt.columns:
+                df["engulfing"] = patt["CDL_ENGULFING"]
+            if "CDL_DOJI" in patt.columns:
+                df["doji"] = patt["CDL_DOJI"]
+        except Exception:
+            pass
+    else:
+        high_low = df["high"] - df["low"]
+        high_close = (df["high"] - df["close"].shift()).abs()
+        low_close = (df["low"] - df["close"].shift()).abs()
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        df["atr14"] = tr.rolling(14).mean()
+        delta = df["close"].diff()
+        up = delta.clip(lower=0)
+        down = -1 * delta.clip(upper=0)
+        roll_up = up.rolling(14).mean()
+        roll_down = down.rolling(14).mean()
+        rs = roll_up / (roll_down + 1e-9)
+        df["rsi14"] = 100 - (100 / (1 + rs))
+        df["ma50"] = df["close"].rolling(50).mean()
+        df["ma200"] = df["close"].rolling(200).mean()
+        df["rv_96"] = df["ret_1"].rolling(96).std() * np.sqrt((24*60)/timeframe_to_minutes(CONFIG["TIMEFRAME"]) * 252)
+        df["body"] = (df["close"] - df["open"]).abs()
+        df["range"] = df["high"] - df["low"]
+        df["doji"] = ((df["body"] / (df["range"] + 1e-9)) < 0.1).astype(int)
+        df["engulfing"] = 0
+        for i in range(1, len(df)):
+            prev = df.iloc[i-1]
+            cur = df.iloc[i]
+            if (prev["close"] < prev["open"]) and (cur["close"] > cur["open"]) and (cur["close"] > prev["open"]) and (cur["open"] < prev["close"]):
+                df.iat[i, df.columns.get_loc("engulfing")] = 1
+    df = df.drop(columns=["ln_close"], errors="ignore")
+    return df
+
+def add_labels(df):
+    df = df.copy()
+    df["y_raw"] = df["close"].shift(-1) - df["close"]
+    df["y_bin"] = (df["y_raw"] > 0).astype(int)
+    return df.iloc[:-1].copy()
+
+# -------------------------
+# 2D->3D transform
+# -------------------------
+def X_3d_RNN(X_2d: np.ndarray, y: np.ndarray, lag: int):
+    n = X_2d.shape[0]
+    Xs = []
+    ys = []
+    for i in range(lag, n):
+        Xs.append(X_2d[i-lag:i, :])
+        ys.append(y[i])
+    return np.array(Xs), np.array(ys)
+
+# -------------------------
+# RNN builder
+# -------------------------
+def build_rnn(input_shape, units=48, n_layers=2, dropout=0.4, rnn_type="LSTM", lr=1e-3):
+    model = Sequential()
+    model.add(InputLayer(input_shape=input_shape))
+    for i in range(n_layers):
+        ret = True if i < (n_layers-1) else False
+        if rnn_type.upper() == "LSTM":
+            model.add(LSTM(units=units, return_sequences=ret))
+        else:
+            model.add(GRU(units=units, return_sequences=ret))
+        model.add(Dropout(dropout))
+    model.add(Dense(1, activation='sigmoid'))
+    model.compile(loss='binary_crossentropy', optimizer=Adam(learning_rate=lr), metrics=['AUC'])
+    return model
+
+# -------------------------
+# pip value & backtest
+# -------------------------
+def compute_pip_value_usd(syminfo):
+    pip = 0.01
+    tick_value = getattr(syminfo, "trade_tick_value", None)
+    tick_size = getattr(syminfo, "trade_tick_size", None)
+    if tick_value and tick_size:
+        try:
+            pip_value = tick_value * (pip / tick_size)
+            return float(pip_value), pip
+        except Exception:
+            pass
+    return None, pip
+
+def backtest_with_costs(df_prices, signals, symbol_info, config=CONFIG):
+    df = df_prices.copy().reset_index(drop=True)
+    pos = np.where(signals==1, 1, -1)
+    price_open = df["open"].values
+    price_close = df["close"].values
+    pip_value, pip = compute_pip_value_usd(symbol_info)
+    if pip_value is None:
+        bar_ret_pct = (price_close - price_open) / price_open
+        pos_ret = pos * bar_ret_pct
+        net_ret = pos_ret
+    else:
+        pips_move = (price_close - price_open) / pip
+        pnl_per_lot = pips_move * pip_value
+        pnl_pos = pos * pnl_per_lot
+        cost_per_trade = (config["SPREAD_PIPS"] + config["SLIPPAGE_PIPS"]) * pip_value + config["COMMISSION_RT_USD"]
+        costs = np.zeros_like(pnl_pos)
+        prev_pos = 0
+        for i in range(len(pos)):
+            if pos[i] != prev_pos:
+                costs[i] = cost_per_trade
+            prev_pos = pos[i]
+        net_ret = pnl_pos - costs
+    cum = np.cumsum(net_ret)
+    running_max = np.maximum.accumulate(cum)
+    drawdown = running_max - cum
+    max_dd = drawdown.max() if len(drawdown)>0 else 0.0
+    total = cum[-1] if len(cum)>0 else 0.0
+    bars_per_day = (24*60)/timeframe_to_minutes(CONFIG["TIMEFRAME"])
+    ann_factor = np.sqrt(252 * bars_per_day)
+    sharpe = (np.mean(net_ret)/np.std(net_ret))*ann_factor if np.std(net_ret) != 0 else 0.0
+    pf = (net_ret[net_ret>0].sum() / (-net_ret[net_ret<0].sum() + 1e-9)) if net_ret.sum() != 0 else 0.0
+    ratio = total / (max_dd + 1e-9)
+    return {"net_ret": net_ret, "cum": cum, "total": total, "max_dd": max_dd, "sharpe": sharpe, "pf": pf, "ratio": ratio}
+
+# -------------------------
+# Training ensemble (bagging)
+# -------------------------
+def train_ensemble(X_train_3d, y_train, X_val_3d, y_val, X_test_3d, y_test, df_test_prices, symbol_info, config=CONFIG):
+    n_models = config["N_MODELS"]
+    metas = []
+    idxs = np.arange(X_train_3d.shape[0])
+    for i in tqdm(range(n_models), desc="Train models"):
+        boot = np.random.choice(idxs, size=len(idxs), replace=True)
+        Xb, yb = X_train_3d[boot], y_train[boot]
+        units = random.choice([32,48,64])
+        dropout = random.choice([0.3,0.4,0.5])
+        lr = random.choice([1e-3,5e-4])
+        rnn_type = random.choice(["LSTM","GRU"])
+        model = build_rnn(input_shape=(Xb.shape[1], Xb.shape[2]), units=units, n_layers=2, dropout=dropout, rnn_type=rnn_type, lr=lr)
+        es = EarlyStopping(monitor='val_loss', patience=config["PATIENCE"], restore_best_weights=True, verbose=0)
+        model.fit(Xb, yb, validation_data=(X_val_3d, y_val), epochs=config["EPOCHS"], batch_size=config["BATCH_SIZE"], callbacks=[es], verbose=0)
+        name = f"model_{i}_{rnn_type}_u{units}_d{int(dropout*100)}.h5"
+        path = os.path.join(config["MODEL_DIR"], name)
+        model.save(path)
+        y_prob = model.predict(X_test_3d, batch_size=256).reshape(-1)
+        signals = (y_prob > 0.5).astype(int)
+        metrics = backtest_with_costs(df_test_prices, signals, symbol_info, config)
+        meta = {"i":i, "path":path, "units":units, "dropout":dropout, "rnn_type":rnn_type}
+        meta.update(metrics)
+        metas.append(meta)
+        tf.keras.backend.clear_session()
+    return metas
+
+def select_and_save(metas, scaler, feature_cols, config=CONFIG):
+    metas_sorted = sorted(metas, key=lambda x: x["ratio"], reverse=True)
+    topk = metas_sorted[:config["TOP_K"]]
+    selected = [m["path"] for m in topk]
+    ensemble_meta = {"selected": selected, "created": datetime.utcnow().isoformat(), "thresholds": {"buy":config["THRESH_BUY"], "sell":config["THRESH_SELL"]}}
+    joblib.dump(ensemble_meta, os.path.join(config["MODEL_DIR"], "ensemble_meta.joblib"))
+    joblib.dump(scaler, os.path.join(config["MODEL_DIR"], "scaler.joblib"))
+    joblib.dump(feature_cols, os.path.join(config["MODEL_DIR"], "feature_cols.joblib"))
+    with open(os.path.join(config["MODEL_DIR"], "topk_summary.json"), "w") as f:
+        json.dump(topk, f, default=str, indent=2)
+    return ensemble_meta
+
+# -------------------------
+# PRELOAD & PREDICT HELPERS (tf.function)
+# -------------------------
+def preload_models(model_paths):
+    models = []
+    for p in model_paths:
+        try:
+            m = load_model(p)
+            models.append(m)
+            print(f"[PRELOAD] model loaded: {p}")
+        except Exception as e:
+            print(f"[PRELOAD] failed to load {p}: {e}")
+    return models
+
+def make_predict_fn(model, lookback, n_features):
+    @tf.function(input_signature=[tf.TensorSpec([None, lookback, n_features], tf.float32)])
+    def predict_fn(x):
+        return model(x, training=False)
+    return predict_fn
+
+def build_predict_fns_from_models(models, lookback, n_features):
+    fns = []
+    for m in models:
+        try:
+            fns.append(make_predict_fn(m, lookback, n_features))
+        except Exception as e:
+            print(f"[PRED-FN] creation failed: {e}")
+    return fns
+
+def ensemble_predict_with_cached(predict_fns, X_window):
+    if X_window is None:
+        return None, []
+    X_tensor = tf.convert_to_tensor(X_window, dtype=tf.float32)
+    probs = []
+    times = []
+    for fn in predict_fns:
+        t0 = time.time()
+        try:
+            out = fn(X_tensor)
+            pr = float(tf.reshape(out, [-1])[0].numpy())
+            if not np.isfinite(pr):
+                times.append(time.time()-t0)
+                continue
+            pr = float(np.clip(pr, 0.0, 1.0))
+            probs.append(pr)
+        except Exception as e:
+            print(f"[ENSEMBLE PREDICT] exception: {e}")
+        times.append(time.time()-t0)
+    if len(probs) == 0:
+        return None, times
+    return float(np.mean(probs)), times
+
+def ensemble_vote_majority(predict_fns, X_window, prob_threshold=0.5, required_majority=None):
+    """
+    Fallback vote majoritaire. Retourne (vote, probs).
+    vote: 1=BUY, 0=SELL, -1=abstain
+    probs: liste des probabilités (None si predict failed)
+    """
+    probs = []
+    for fn in predict_fns:
+        try:
+            out = fn(tf.convert_to_tensor(X_window, dtype=tf.float32))
+            pr = float(tf.reshape(out, [-1])[0].numpy())
+            pr = float(np.clip(pr, 0.0, 1.0))
+            probs.append(pr)
+        except Exception as e:
+            print("[VOTE] predict exception:", e)
+            probs.append(None)
+    votes_clean = [1 if p is not None and p > prob_threshold else 0 if p is not None else None for p in probs]
+    votes_valid = [v for v in votes_clean if v is not None]
+    if len(votes_valid) == 0:
+        return -1, probs
+    if required_majority is None:
+        required_majority = (len(votes_valid) // 2) + 1
+    n_buy = sum(1 for v in votes_valid if v==1)
+    n_sell = sum(1 for v in votes_valid if v==0)
+    if n_buy >= required_majority:
+        return 1, probs
+    if n_sell >= required_majority:
+        return 0, probs
+    return -1, probs
+
+# -------------------------
+# Robust window getter (v3)
+# -------------------------
+_FEATURE_HISTORY_NEED = {
+    "ret_1":1, "ret_4":4, "ret_96":96, "ma50":50, "ma200":200,
+    "atr14":14, "rsi14":14, "rv_96":96, "engulfing":2, "doji":1
+}
+
+def required_history_for_features(feature_cols):
+    needs = [_FEATURE_HISTORY_NEED.get(f,0) for f in feature_cols]
+    return int(max(needs)) if needs else 0
+
+def get_latest_window_safe_v3(symbol, timeframe, lookback, scaler, feature_cols, margin_extra=50):
+    req_hist = required_history_for_features(feature_cols)
+    count = lookback + req_hist + margin_extra
+    now_dt = datetime.utcnow()
+    rates = mt5.copy_rates_from(symbol, timeframe, now_dt, int(count))
+    if rates is None or len(rates) == 0:
+        raise RuntimeError(f"MT5 returned no bars (symbol={symbol}). Vérifie connexion MT5 / Market Watch.")
+    df = pd.DataFrame(rates)
+    df["time"] = pd.to_datetime(df["time"], unit="s")
+    df = df.set_index("time").sort_index()
+    print(f"[DEBUG] raw bars fetched: {len(df)} (requested {count})")
+    df_feat = add_features_full(df)
+    n_before = len(df_feat)
+    nan_counts = df_feat[feature_cols].isna().sum().to_dict()
+    print(f"[DEBUG] rows after feature calc: {n_before}; NaNs per feature: {nan_counts}")
+    df_feat_clean = df_feat.dropna(subset=feature_cols, how='any').copy()
+    n_after = len(df_feat_clean)
+    print(f"[DEBUG] rows after dropping NaNs in feature cols: {n_after}")
+    if n_after < lookback:
+        raise RuntimeError(f"Not enough valid bars after feature calc: {n_after} < lookback({lookback}).")
+    # take last lookback rows; if n==lookback reshape directly
+    df_win = df_feat_clean.iloc[-lookback:].copy()
+    X2d = df_win[feature_cols].values
+    if np.isnan(X2d).any() or np.isinf(X2d).any():
+        raise RuntimeError("NaN/Inf detected in features before scaling.")
+    X2d_scaled = scaler.transform(X2d)
+    n = X2d_scaled.shape[0]
+    if n == lookback:
+        X_window = X2d_scaled.reshape(1, lookback, X2d_scaled.shape[1]).astype(np.float32)
+    elif n > lookback:
+        X3d, _ = X_3d_RNN(X2d_scaled, np.zeros((n,)), lag=lookback)
+        if X3d.size == 0 or X3d.shape[0] < 1:
+            raise RuntimeError("Construction of 3D window returned empty after scaling.")
+        X_window = X3d[-1:].astype(np.float32)
+    else:
+        raise RuntimeError("Unexpected: n < lookback after scaling.")
+    return X_window, df_win
+
+# -------------------------
+# Order & sizing helpers
+# -------------------------
+def calc_lot_from_risk(account_equity, risk_pct, atr, symbol_info):
+    pip_value, pip = compute_pip_value_usd(symbol_info)
+    if pip_value is None:
+        return 0.01
+    risk_usd = account_equity * (risk_pct / 100.0)
+    stop_pips = max(1.0, float(atr) / pip)
+    lot = risk_usd / (stop_pips * pip_value + 1e-9)
+    lot_min = getattr(symbol_info, "volume_min", 0.01)
+    lot_step = getattr(symbol_info, "volume_step", 0.01)
+    if lot < lot_min:
+        lot = lot_min
+    if lot_step>0:
+        lot = round(lot/lot_step) * lot_step
+    return float(lot)
+
+def send_order_market(symbol, side, lot, sl_price, tp_price, symbol_info, config=CONFIG):
+    if config["DRY_RUN"]:
+        print(f"[DRY RUN] send_order_market: {symbol} side={side} lot={lot} SL={sl_price} TP={tp_price}")
+        return {"ret":"dry"}
+    price = mt5.symbol_info_tick(symbol).ask if side==1 else mt5.symbol_info_tick(symbol).bid
+    deviation = 20
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": lot,
+        "type": mt5.ORDER_TYPE_BUY if side==1 else mt5.ORDER_TYPE_SELL,
+        "price": price,
+        "sl": sl_price,
+        "tp": tp_price,
+        "deviation": deviation,
+        "magic": 123456,
+        "comment":"ensemble_rnn",
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+    result = mt5.order_send(request)
+    print("order_send result:", result)
+    return result
+
+# -------------------------
+# Logging helpers
+# -------------------------
+def log_iteration(model_dir, row: dict):
+    log_path = os.path.join(model_dir, "live_iteration_log.csv")
+    df = pd.DataFrame([row])
+    header = not os.path.exists(log_path)
+    df.to_csv(log_path, mode='a', header=header, index=False)
+
+# -------------------------
+# Full pipeline train -> select
+# -------------------------
+def pipeline_train_run(config=CONFIG):
+    print("Starting pipeline train_run...")
+    df = fetch_mt5(config["SYMBOL"], config["TIMEFRAME"], config["START"], config["END"])
+    df = add_features_full(df)
+    df = add_labels(df)
+    df = df.dropna().copy()
+    feature_cols = config["FEATURE_COLS"]
+    missing = [c for c in feature_cols if c not in df.columns]
+    if missing:
+        raise RuntimeError("Missing feature cols: " + ",".join(missing))
+    X = df[feature_cols].values
+    y = df["y_bin"].values
+    n = len(df)
+    split_idx = int((1.0 - config["TEST_SIZE"]) * n)
+    train_end = int(0.8 * split_idx)
+    X_train2 = X[:train_end]; y_train = y[:train_end]
+    X_val2 = X[train_end:split_idx]; y_val = y[train_end:split_idx]
+    X_test2 = X[split_idx:]; y_test = y[split_idx:]
+    scaler = StandardScaler()
+    X_train_s = scaler.fit_transform(X_train2)
+    X_val_s = scaler.transform(X_val2)
+    X_test_s = scaler.transform(X_test2)
+    joblib.dump(scaler, os.path.join(config["MODEL_DIR"], "scaler.joblib"))
+    joblib.dump(feature_cols, os.path.join(config["MODEL_DIR"], "feature_cols.joblib"))
+    lag = config["LOOKBACK"]
+    X_train_3d, y_train_3d = X_3d_RNN(X_train_s, y_train, lag)
+    X_val_3d, y_val_3d = X_3d_RNN(X_val_s, y_val, lag)
+    X_test_3d, y_test_3d = X_3d_RNN(X_test_s, y_test, lag)
+    df_test_prices = df.iloc[split_idx + lag : split_idx + lag + len(X_test_3d)].copy().reset_index(drop=True)
+    syminfo = init_mt5()
+    metas = train_ensemble(X_train_3d, y_train_3d, X_val_3d, y_val_3d, X_test_3d, y_test_3d, df_test_prices, syminfo, config)
+    ensemble_meta = select_and_save(metas, scaler, feature_cols, config)
+    print("Ensemble created:", ensemble_meta)
+    return ensemble_meta
+
+# -------------------------
+# Live screener (updated)
+# -------------------------
+def sleep_until_next_candle(timeframe_minutes=15, buffer_seconds=2):
+    now = datetime.utcnow()
+    minute = now.minute
+    remainder = timeframe_minutes - (minute % timeframe_minutes)
+    next_candle = (now + timedelta(minutes=remainder)).replace(second=0, microsecond=0)
+    wait = (next_candle - now).total_seconds() + buffer_seconds
+    if wait < 0:
+        wait = buffer_seconds
+    print(f"[SLEEP] now={now.strftime('%H:%M:%S')} -> next_candle={next_candle.strftime('%Y-%m-%d %H:%M:%S')}, sleeping {int(wait)}s")
+    time.sleep(wait)
+
+def last_logged_candle_index(model_dir, timeframe_minutes):
+    p = os.path.join(model_dir, "live_iteration_log.csv")
+    if not os.path.exists(p):
+        return None
+    try:
+        df = pd.read_csv(p)
+        if len(df)==0:
+            return None
+        last_ts = pd.to_datetime(df["ts"].iloc[-1])
+        return int(last_ts.timestamp() // (60 * timeframe_minutes))
+    except Exception:
+        return None
+
+def live_screener_loop(config=CONFIG):
+    print("Starting live screener (DRY_RUN=%s)." % config["DRY_RUN"])
+    syminfo = init_mt5()
+    scaler = joblib.load(os.path.join(config["MODEL_DIR"], "scaler.joblib"))
+    ensemble_meta = joblib.load(os.path.join(config["MODEL_DIR"], "ensemble_meta.joblib"))
+    model_paths = ensemble_meta.get("selected", [])
+    feature_cols = joblib.load(os.path.join(config["MODEL_DIR"], "feature_cols.joblib"))
+    if len(model_paths) == 0:
+        raise RuntimeError("No selected models in ensemble_meta.joblib")
+    models_cached = preload_models(model_paths)
+    n_features = len(feature_cols)
+    lookback = config["LOOKBACK"]
+    predict_fns = build_predict_fns_from_models(models_cached, lookback, n_features)
+    print(f"[LIVE] Loaded {len(models_cached)} models, created {len(predict_fns)} predict functions")
+    while True:
+        try:
+            try:
+                Xw, dfwin = get_latest_window_safe_v3(config["SYMBOL"], config["TIMEFRAME"], lookback, scaler, feature_cols, margin_extra=200)
+            except RuntimeError as e:
+                print(f"[LIVE] Window unavailable: {e}. Sleep & retry.")
+                time.sleep(10)
+                continue
+            # fast average prediction
+            p_avg, times = ensemble_predict_with_cached(predict_fns, Xw)
+            avg_time = float(np.mean(times)) if len(times) else None
+            # majority-first policy
+            vote_majority, probs_for_vote = ensemble_vote_majority(predict_fns, Xw, prob_threshold=0.5)
+            if vote_majority in (0,1):
+                vote = vote_majority
+                probs_to_log = probs_for_vote
+            else:
+                if p_avg is None:
+                    vote = -1
+                    probs_to_log = probs_for_vote
+                elif p_avg > config["THRESH_BUY"]:
+                    vote = 1; probs_to_log = probs_for_vote
+                elif p_avg < config["THRESH_SELL"]:
+                    vote = 0; probs_to_log = probs_for_vote
+                else:
+                    vote = -1; probs_to_log = probs_for_vote
+            print(f"[LIVE] Ensemble avg prob: {p_avg}, avg model time: {avg_time}s, vote: {vote}")
+            action = "abstain"; sl_price = tp_price = None; lot = 0.0
+            if vote in (0,1):
+                account = mt5.account_info()
+                equity = account.balance if account is not None else 10000.0
+                atr = float(dfwin["atr14"].iloc[-1])
+                # lot = calc_lot_from_risk(equity, config["RISK_PER_TRADE_PCT"], atr, syminfo)
+                lot = 0.01
+                sl_proximity = atr * 1.0
+                tp_prox = atr * 1.5
+                last_price = mt5.symbol_info_tick(config["SYMBOL"]).ask if vote==1 else mt5.symbol_info_tick(config["SYMBOL"]).bid
+                sl_price = last_price - sl_proximity if vote==1 else last_price + sl_proximity
+                tp_price = last_price + tp_prox if vote==1 else last_price - tp_prox
+                res = send_order_market(config["SYMBOL"], vote, lot, sl_price, tp_price, syminfo, config)
+                action = "sent" if not config["DRY_RUN"] else "dry"
+            # dedup: one line per candle
+            timeframe_minutes = timeframe_to_minutes(config["TIMEFRAME"])
+            candle_index = int(datetime.utcnow().timestamp() // (60 * timeframe_minutes))
+            last_candle_index = last_logged_candle_index(config["MODEL_DIR"], timeframe_minutes)
+            probs_str = ",".join([str(round(p,4)) if p is not None else "NA" for p in (probs_to_log if probs_to_log is not None else [])])
+            # If same candle and identical decision, skip logging (avoid duplicates)
+            skip_log = False
+            if last_candle_index is not None and candle_index == last_candle_index:
+                # compare last logged vote and probs
+                p = os.path.join(config["MODEL_DIR"], "live_iteration_log.csv")
+                try:
+                    df_last = pd.read_csv(p)
+                    last_vote = int(df_last["vote"].iloc[-1])
+                    last_probs = df_last["probs"].iloc[-1]
+                    if last_vote == int(vote) and last_probs == probs_str:
+                        skip_log = True
+                except Exception:
+                    skip_log = False
+            if not skip_log:
+                log_row = {
+                    "ts": datetime.utcnow().isoformat(),
+                    "symbol": config["SYMBOL"],
+                    "p_avg": float(p_avg) if p_avg is not None else None,
+                    "n_models": len(predict_fns),
+                    "vote": int(vote),
+                    "probs": probs_str,
+                    "lot": float(lot),
+                    "sl": float(sl_price) if sl_price is not None else None,
+                    "tp": float(tp_price) if tp_price is not None else None,
+                    "action": action
+                }
+                log_iteration(config["MODEL_DIR"], log_row)
+            else:
+                print("[LIVE] Duplicate decision in same candle -> skip logging/trade re-execution.")
+        except Exception as e:
+            print("[LIVE] Exception in main loop:", e)
+            import traceback
+            traceback.print_exc()
+
+        # wait until next candle close (change to sleep_until_next_candle in production)
+        time.sleep(15)
+        # WAIT until next candle close (instead of busy-loop)
+        # sleep_until_next_candle(15) # 15 minutes timeframe
+
+# -------------------------
+# ENTRYPOINT
+# -------------------------
+def run():
+    print("CONFIG summary:")
+    print({k:CONFIG[k] for k in ["SYMBOL","TIMEFRAME","START","LOOKBACK","N_MODELS","EPOCHS","DRY_RUN","QUICK_TEST"]})
+    # run training pipeline if models not found
+    if not os.path.exists(os.path.join(CONFIG["MODEL_DIR"], "ensemble_meta.joblib")):
+        print("No ensemble found, training pipeline...")
+        pipeline_train_run(CONFIG)
+    # start live screener (DRY_RUN by default)
+    live_screener_loop(CONFIG)

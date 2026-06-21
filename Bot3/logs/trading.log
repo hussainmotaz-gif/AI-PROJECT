@@ -1,0 +1,27 @@
+2025-08-12 14:30:23,789 - trading_system.main - INFO - __init__:47 - Système de trading initialisé
+2025-08-12 14:30:23,789 - trading_system.main - INFO - load_models:188 - Chargement des modèles pré-entraînés...
+2025-08-12 14:30:23,789 - trading_system.ensemble_manager - INFO - create_models:45 - Création de 5 modèles LSTM
+2025-08-12 14:30:23,789 - trading_system.lstm_model - INFO - _configure_tensorflow:49 - Pas de GPU détecté, utilisation du CPU
+2025-08-12 14:30:23,789 - trading_system.lstm_model - INFO - _configure_tensorflow:49 - Pas de GPU détecté, utilisation du CPU
+2025-08-12 14:30:23,789 - trading_system.lstm_model - INFO - _configure_tensorflow:49 - Pas de GPU détecté, utilisation du CPU
+2025-08-12 14:30:23,789 - trading_system.lstm_model - INFO - _configure_tensorflow:49 - Pas de GPU détecté, utilisation du CPU
+2025-08-12 14:30:23,789 - trading_system.lstm_model - INFO - _configure_tensorflow:49 - Pas de GPU détecté, utilisation du CPU
+2025-08-12 14:30:23,805 - trading_system.ensemble_manager - INFO - create_models:52 - Ensemble de 5 modèles créé
+2025-08-12 14:30:23,805 - trading_system.ensemble_manager - INFO - load_ensemble:377 - Chargement de l'ensemble de modèles
+2025-08-12 14:30:23,805 - trading_system.lstm_model - WARNING - load_model:394 - Modèle 0 non trouvé: E:\laragon\www\10.trading\IA\2.DeepLearningPython\V1\deepLearning\claude\models\XAUUSD\XAUUSD_model_0.model.h5
+2025-08-12 14:30:23,805 - trading_system.lstm_model - WARNING - load_model:394 - Modèle 1 non trouvé: E:\laragon\www\10.trading\IA\2.DeepLearningPython\V1\deepLearning\claude\models\XAUUSD\XAUUSD_model_1.model.h5
+2025-08-12 14:30:23,805 - trading_system.lstm_model - WARNING - load_model:394 - Modèle 2 non trouvé: E:\laragon\www\10.trading\IA\2.DeepLearningPython\V1\deepLearning\claude\models\XAUUSD\XAUUSD_model_2.model.h5
+2025-08-12 14:30:23,805 - trading_system.lstm_model - WARNING - load_model:394 - Modèle 3 non trouvé: E:\laragon\www\10.trading\IA\2.DeepLearningPython\V1\deepLearning\claude\models\XAUUSD\XAUUSD_model_3.model.h5
+2025-08-12 14:30:23,805 - trading_system.lstm_model - WARNING - load_model:394 - Modèle 4 non trouvé: E:\laragon\www\10.trading\IA\2.DeepLearningPython\V1\deepLearning\claude\models\XAUUSD\XAUUSD_model_4.model.h5
+2025-08-12 14:30:23,805 - trading_system.data_processor - WARNING - load_scalers:278 - Fichiers de scalers non trouvés
+2025-08-12 14:30:23,805 - trading_system.ensemble_manager - INFO - load_ensemble:407 - Ensemble chargé: 0/5 modèles, sélectionnés: []
+2025-08-12 14:30:23,805 - trading_system.main - WARNING - load_models:200 - Échec du chargement des modèles
+2025-08-12 14:30:23,805 - trading_system.main - INFO - cleanup:436 - Nettoyage des ressources du système
+2025-08-12 16:36:58,429 - trading_system.main - INFO - __init__:47 - Système de trading initialisé
+2025-08-12 16:36:58,440 - trading_system.main - INFO - train_models:114 - ==================================================
+2025-08-12 16:36:58,440 - trading_system.main - INFO - train_models:115 - DÉBUT DE L'ENTRAÎNEMENT DES MODÈLES
+2025-08-12 16:36:58,440 - trading_system.main - INFO - train_models:116 - ==================================================
+2025-08-12 16:36:58,440 - trading_system.main - INFO - fetch_data:75 - Récupération des données pour XAUUSD (période: max)
+2025-08-12 16:37:00,580 - trading_system.main - ERROR - fetch_data:100 - Erreur lors de la récupération des données: Aucune donnée récupérée pour XAUUSD
+2025-08-12 16:37:00,580 - trading_system.runner - ERROR - train_models_command:74 - Erreur entraînement: Impossible de récupérer les données: Aucune donnée récupérée pour XAUUSD
+2025-08-12 16:37:00,584 - trading_system.main - INFO - cleanup:436 - Nettoyage des ressources du système
